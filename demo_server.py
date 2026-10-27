@@ -43,9 +43,16 @@ BOUNDARY = '----JavaFormBoundary7MA4'
 STATE = {'requests': 0, 'success': 0, 'errors': 0, 'registrations': 0, 'start': time.time()}
 LOCK = threading.Lock()
 POOL_LOCK = threading.Lock()
-POOL = []  # [{id, mm, cookie, ts, used, credits}]
+POOL = []  # [{id, mm, cookie, ts, used, credits, inflight}]
 POOL_FILE = 'device_pool.json'
 FREE_PER_ACCOUNT = 5  # app 本地免费次数 (m.java: freecishu cs>=5)
+
+# ---- 并发号池参数 (面向几百并发) ----
+TARGET_POOL = 16        # 目标常驻可用号 (16 号 × 5 次 = 80 发弹匣)
+MIN_POOL = 8            # 低于此数立即触发补号
+MAX_POOL = 40           # 硬上限 (防注册失控)
+REG_MIN_INTERVAL = 3.0  # 相邻两次注册最小间隔 (秒) — 避免注册风暴触发风控
+REFILL_INTERVAL = 5.0   # 补号线程巡检周期
 
 def _save_pool():
     try:
@@ -99,7 +106,7 @@ def _register():
     with LOCK:
         STATE['registrations'] += 1
     return {'id': str(j['id']), 'mm': j['mima'], 'cookie': jar, 'ts': time.time(),
-            'used': 0, 'credits': FREE_PER_ACCOUNT}
+            'used': 0, 'credits': FREE_PER_ACCOUNT, 'inflight': 0}
 
 def _relogin(acct):
     """会话过期时用已有账号重新登录 (不消耗注册次数)"""
@@ -128,68 +135,161 @@ def _probe_credit(acct):
         return 1  # 有额度
     return 0       # 额度尽/被拒
 
-def get_account():
-    """从池取可用号; 无可用号时自动扩容注册 (重试 3 次).
-    账号额度用尽 (credits<=0) 即淘汰, 注册新号补充."""
-    with POOL_LOCK:
-        now = time.time()
-        # 会话 30 分钟保鲜
-        for a in reversed(POOL):
-            if a.get('credits', FREE_PER_ACCOUNT) > 0:
-                if now - a.get('ts', 0) > 1800:
-                    if not _relogin(a):
-                        a['credits'] = 0
-                        continue
-                return a
-    # 池空/全耗尽 → 扩容 (探测池尾旧号是否恢复, 否则注册新号)
-    for _ in range(3):
-        acct = _register()
+# ---- 并发取号: 信号量 + 账号 inflight 计数 ----
+# 每个号同时只跑 1 个生成任务 (同 cookie 并发任务会互相顶掉会话),
+# 池子足够大时 16 号并行 ≈ 上游真实吞吐上限 (~50s/张).
+ACCT_SEM = {}  # id -> threading.Semaphore
+
+def _sem(acct):
+    s = ACCT_SEM.get(acct['id'])
+    if not s:
+        s = threading.Semaphore(1)
+        ACCT_SEM[acct['id']] = s
+    return s
+
+def _try_acquire(acct, wait=False):
+    """尝试独占该账号 (非阻塞). wait=True 时阻塞等待."""
+    ok = (_sem(acct).acquire() if wait else _sem(acct).acquire(blocking=False))
+    if ok:
+        acct['inflight'] = acct.get('inflight', 0) + 1
+    return ok
+
+def _release(acct):
+    try:
+        acct['inflight'] = max(0, acct.get('inflight', 1) - 1)
+        _sem(acct).release()
+    except ValueError:
+        pass
+
+def get_account(wait=False):
+    """从池取可用号: 优先取空闲号(非阻塞), 全忙时:
+    - wait=True: 轮询等待最早释放的号
+    - wait=False: 交给补号线程扩容, 自旋短等
+    额度尽 (credits<=0) 的号被淘汰 (补号线程负责清理和注册补充)."""
+    deadline = time.time() + (120 if wait else 25)
+    while time.time() < deadline:
         with POOL_LOCK:
-            POOL.append(acct)
-            _save_pool()
-        return acct
-    raise RuntimeError('号池扩容失败 (注册 3 次均失败)')
+            now = time.time()
+            candidates = [a for a in POOL if a.get('credits', 0) > 0]
+            # 会话保鲜: 超过 25 分钟的重登录 (每号只做一次, 由取到号的线程做)
+            for a in candidates:
+                if now - a.get('ts', 0) > 1500:
+                    a['stale'] = True
+        for a in candidates:
+            if a.get('stale'):
+                if _relogin(a):
+                    a['ts'] = time.time()
+                    a.pop('stale', None)
+                else:
+                    a['credits'] = 0
+                    a.pop('stale', None)
+                    continue
+            if _try_acquire(a, wait=False):
+                return a
+        if wait:
+            time.sleep(0.3)
+        else:
+            time.sleep(0.5)
+    raise RuntimeError('no available account in pool (timeout)')
+
+def _refill_loop():
+    """后台补号线程: 让池子始终保有 TARGET_POOL 个可用号.
+    - 低于 MIN_POOL: 立即补 (受注册限速约束)
+    - 低于 TARGET_POOL: 缓慢补
+    - 清理额度尽的号 (保留记录用于统计, 标记 dead 不再取用)
+    - 注册失败指数退避"""
+    global POOL
+    backoff = REG_MIN_INTERVAL
+    while True:
+        try:
+            time.sleep(REFILL_INTERVAL)
+            with POOL_LOCK:
+                alive = [a for a in POOL if a.get('credits', 0) > 0]
+                need_min = len(alive) < MIN_POOL
+                need_soft = len(alive) < TARGET_POOL
+                # 清理死号出池 (保留在 dead_accounts 统计里)
+                dead = [a for a in POOL if a.get('credits', 0) <= 0 and a.get('inflight', 0) == 0]
+                for d in dead:
+                    POOL.remove(d)
+                if dead:
+                    _save_pool()
+            if not (need_min or need_soft):
+                backoff = REG_MIN_INTERVAL
+                continue
+            # 注册限速: 单飞 + 最小间隔
+            with REG_LOCK:
+                with POOL_LOCK:
+                    if len(POOL) >= MAX_POOL:
+                        continue
+                try:
+                    acct = _register()
+                    backoff = REG_MIN_INTERVAL
+                except Exception:
+                    time.sleep(backoff)
+                    backoff = min(backoff * 2, 60)
+                    continue
+                with POOL_LOCK:
+                    POOL.append(acct)
+                    _save_pool()
+        except Exception as e:
+            try:
+                sys.stderr.write(f'[refill] {e}\n')
+            except Exception:
+                pass
+
+REG_LOCK = threading.Lock()
+
+def start_refill():
+    threading.Thread(target=_refill_loop, daemon=True).start()
 
 def generate(prompt, chicun='1*1'):
-    """完整生成链路: 合规 -> 提交 -> 轮询. 会话失效自动重登录, 额度尽自动换号."""
+    """完整生成链路: 合规 -> 提交 -> 轮询.
+    号池模式: 独占账号(同号单飞) -> 生成 -> 释放; 失败按原因处理额度."""
+    last_err = None
     for attempt in range(3):
-        acct = get_account()
-        j, _ = post_form('/ctext!isweigui.action', [('textinfo', prompt)], acct['cookie'])
-        if str(j.get('st')) == '-1':  # 会话过期 -> 重新登录
-            if _relogin(acct):
-                j, _ = post_form('/ctext!isweigui.action', [('textinfo', prompt)], acct['cookie'])
-            else:
+        acct = get_account(wait=True)
+        try:
+            j, _ = post_form('/ctext!isweigui.action', [('textinfo', prompt)], acct['cookie'])
+            if str(j.get('st')) == '-1':  # 会话过期 -> 重新登录
+                if _relogin(acct):
+                    j, _ = post_form('/ctext!isweigui.action', [('textinfo', prompt)], acct['cookie'])
+                else:
+                    acct['credits'] = 0
+                    continue
+            if str(j.get('st')) == '1' and j.get('weigui'):
+                raise RuntimeError('内容违规 (weigui=true)')
+            if str(j.get('st')) != '1':
+                raise RuntimeError(f'isweigui fail: {j}')
+            j2, _ = post_form('/qwenpic!zhizuo.action',
+                              [('miaoshu', prompt), ('chicun', chicun), ('fengge', '')], acct['cookie'])
+            if str(j2.get('st')) != '1':
+                # 该号额度尽/被拒 -> 扣光淘汰, 换号重试
                 acct['credits'] = 0
+                last_err = f'zhizuo fail: {j2}'
                 continue
-        if str(j.get('st')) == '1' and j.get('weigui'):
-            raise RuntimeError('内容违规 (weigui=true)')
-        if str(j.get('st')) != '1':
-            raise RuntimeError(f'isweigui fail: {j}')
-        j2, _ = post_form('/qwenpic!zhizuo.action',
-                          [('miaoshu', prompt), ('chicun', chicun), ('fengge', '')], acct['cookie'])
-        if str(j2.get('st')) == '1':
+            # 提交成功 = 消耗 1 次
             with POOL_LOCK:
                 acct['used'] = acct.get('used', 0) + 1
                 acct['credits'] = max(0, FREE_PER_ACCOUNT - acct['used'])
                 acct['ts'] = time.time()
                 _save_pool()
             tid = j2['taskid']
-        else:
-            # 该号额度尽/被拒 -> 淘汰并换号重试
-            with POOL_LOCK:
-                acct['credits'] = 0
-                _save_pool()
-            continue
-        for _ in range(60):
-            time.sleep(1.2)
-            j3, _ = post_form('/qwenpic!jieguo.action', [('taskid', tid)], acct['cookie'])
-            st = str(j3.get('st'))
-            if st == '1':
-                return j3['picurl'], tid
-            if st != '2':
-                break
-        break
-    raise RuntimeError('生成失败 (号池 3 次尝试均未成功)')
+            ok = False
+            for _ in range(60):
+                time.sleep(1.2)
+                j3, _ = post_form('/qwenpic!jieguo.action', [('taskid', tid)], acct['cookie'])
+                st = str(j3.get('st'))
+                if st == '1':
+                    return j3['picurl'], tid
+                if st != '2':
+                    last_err = f'jieguo fail: {j3}'
+                    break
+            else:
+                last_err = 'jieguo timeout'
+            break  # 提交成功但结果失败: 不换号 (任务可能还在跑)
+        finally:
+            _release(acct)
+    raise RuntimeError(f'生成失败: {last_err}')
 
 CHICUN_MAP = {'1024x1024': '1*1', '1*1': '1*1', '768x1344': '9*16', '9*16': '9*16',
               '1344x768': '16*9', '16*9': '16*9'}
@@ -212,9 +312,12 @@ class H(BaseHTTPRequestHandler):
             with POOL_LOCK:
                 s['pool_size'] = len(POOL)
                 s['pool_alive'] = sum(1 for a in POOL if a.get('credits', 0) > 0)
+                s['pool_idle'] = sum(1 for a in POOL if a.get('credits', 0) > 0 and a.get('inflight', 0) == 0)
                 s['pool_total_credits'] = sum(max(0, a.get('credits', 0)) for a in POOL)
+                s['target_pool'] = TARGET_POOL
                 s['accounts'] = [{'id': a['id'], 'credits': max(0, a.get('credits', 0)),
-                                  'used': a.get('used', 0)} for a in POOL]
+                                  'used': a.get('used', 0),
+                                  'busy': a.get('inflight', 0) > 0} for a in POOL[:24]]
             s['uptime_s'] = round(time.time() - s.pop('start'), 1)
             return self._json(200, {'status': 'ok', 'upstream': 'qwen_image3 via huahuashi.durl.info', **s})
         if u.path == '/v1/pool':
@@ -222,8 +325,18 @@ class H(BaseHTTPRequestHandler):
             qs = parse_qs(u.query)
             with POOL_LOCK:
                 accounts = [{'id': a['id'], 'credits': max(0, a.get('credits', 0)),
-                             'used': a.get('used', 0), 'age_min': round((time.time()-a.get('ts',0))/60, 1)}
+                             'used': a.get('used', 0),
+                             'busy': a.get('inflight', 0) > 0,
+                             'age_min': round((time.time()-a.get('ts',0))/60, 1)}
                             for a in POOL]
+                summary = {'pool_size': len(POOL),
+                           'alive': sum(1 for a in POOL if a.get('credits', 0) > 0),
+                           'idle': sum(1 for a in POOL if a.get('credits', 0) > 0 and a.get('inflight', 0) == 0),
+                           'total_credits': sum(max(0, a.get('credits', 0)) for a in POOL),
+                           'target_pool': TARGET_POOL, 'min_pool': MIN_POOL,
+                           'free_per_account': FREE_PER_ACCOUNT,
+                           'auto_expand': True,
+                           'accounts': accounts}
             if qs.get('probe', ['false'])[0] == 'true':
                 with POOL_LOCK:
                     targets = [a for a in POOL if a.get('credits', 0) > 0]
@@ -232,13 +345,7 @@ class H(BaseHTTPRequestHandler):
                     a['last_probe'] = r
                 with POOL_LOCK: _save_pool()
             with POOL_LOCK:
-                return self._json(200, {
-                    'pool_size': len(POOL),
-                    'alive': sum(1 for a in POOL if a.get('credits', 0) > 0),
-                    'total_credits': sum(max(0, a.get('credits', 0)) for a in POOL),
-                    'free_per_account': FREE_PER_ACCOUNT,
-                    'auto_expand': True,
-                    'accounts': accounts})
+                return self._json(200, summary)
         if u.path == '/v1/styles':
             """app 预设风格 (preText.txt 远程可变; 此为静态还原 + 在线刷新)"""
             try:
@@ -321,5 +428,8 @@ async function go(){
 
 if __name__ == '__main__':
     _load_pool()
-    print(f'AI梦境画画师 真实 2API listening on :{ARGS.port} (pool={len(POOL)})')
+    for a in POOL:
+        a.setdefault('inflight', 0)
+    start_refill()
+    print(f'AI梦境画画师 真实 2API listening on :{ARGS.port} (pool={len(POOL)}, target={TARGET_POOL})')
     ThreadingHTTPServer(('127.0.0.1', ARGS.port), H).serve_forever()
